@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "threshold": 500,
+  "api_type": "deepseek",
+  "api_base": "https://api.deepseek.com/v1",
+  "model": "deepseek-chat",
+  "prompt": "请用中文总结以下OCR识别的文字内容，提炼出关键信息，要求简洁清晰，不超过200字：\n\n{text}"
+}

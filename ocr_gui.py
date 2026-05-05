@@ -9,6 +9,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import os
 import sys
+import json
+import threading
 from datetime import datetime
 
 # 笔记库路径
@@ -46,6 +48,45 @@ try:
 except ImportError:
     OCR_AVAILABLE = False
 
+# 总结配置
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SUMMARIZE_CONFIG_PATH = os.path.join(SCRIPT_DIR, "summarize_config.json")
+
+def load_summarize_config():
+    """加载总结配置，API Key 优先从环境变量 DEEPSEEK_API_KEY 读取"""
+    defaults = {
+        "enabled": True, "threshold": 500,
+        "api_type": "deepseek",
+        "api_base": "https://api.deepseek.com/v1", "model": "deepseek-chat",
+        "prompt": "请用中文总结以下OCR识别的文字内容，提炼出关键信息，要求简洁清晰，不超过200字：\n\n{text}"
+    }
+    cfg = defaults.copy()
+    try:
+        with open(SUMMARIZE_CONFIG_PATH, 'r', encoding='utf-8') as f:
+            file_cfg = json.load(f)
+            cfg.update(file_cfg)
+    except Exception:
+        pass
+    # 环境变量优先
+    env_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if env_key:
+        cfg["api_key"] = env_key
+    return cfg
+
+def get_api_key_status():
+    """检查 API Key 配置状态，返回 (是否已配置, 状态提示文字)"""
+    env_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if env_key:
+        return True, "✅ 已配置（环境变量）"
+    try:
+        with open(SUMMARIZE_CONFIG_PATH, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+            if cfg.get("api_key", "").strip() and cfg.get("api_key") != "YOUR_API_KEY_HERE":
+                return True, "⚠️ 已配置（配置文件，建议改用环境变量）"
+    except Exception:
+        pass
+    return False, "❌ 未配置 - 请设置环境变量 DEEPSEEK_API_KEY 或在 summarize_config.json 中配置"
+
 
 class OcrGuiApp:
     def __init__(self, root):
@@ -56,8 +97,10 @@ class OcrGuiApp:
 
         # OCR 结果
         self.ocr_text = ""
+        self.summary_text = ""
         self.current_image = None
         self.vault_path = VAULT_PATH
+        self.summarize_cfg = load_summarize_config()
 
         # 三种状态窗口配置 (宽x高)
         # 状态1: 初始态（无截图）— 紧凑
@@ -175,6 +218,11 @@ class OcrGuiApp:
                                        self.load_image_file, color_key="info",
                                         font_size=11)
         self.load_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.summarize_btn = self._make_btn(btn_bar, "🤖 AI 总结",
+                                            self.do_summarize, color_key="accent",
+                                            font_size=11, state=tk.DISABLED)
+        self.summarize_btn.pack(side=tk.LEFT, padx=(0, 8))
 
         self.clear_btn = self._make_btn(btn_bar, "🗑 清空",
                                         self.clear_all, color_key="muted",
@@ -300,6 +348,8 @@ class OcrGuiApp:
                 self.ocr_btn.config(state=tk.NORMAL)
                 self.result_text.delete(1.0, tk.END)
                 self.ocr_text = ""
+                self.summary_text = ""
+                self.summarize_btn.config(state=tk.DISABLED, text="🤖 AI 总结")
                 self.save_btn.config(state=tk.DISABLED)
                 self.discard_btn.config(state=tk.DISABLED)
                 # 切换到「有图未识别」状态
@@ -363,6 +413,19 @@ class OcrGuiApp:
                 self.result_text.insert(tk.END, f"\n⏱️ 识别耗时: {elapse_str}秒")
                 self.save_btn.config(state=tk.NORMAL)
                 self.discard_btn.config(state=tk.NORMAL)
+                # 字数超过阈值且API已配置 → 启用总结按钮
+                text_len = len(self.ocr_text.replace('\n', '').replace(' ', ''))
+                api_key = self.summarize_cfg.get("api_key", "").strip()
+                api_configured = api_key and api_key != "YOUR_API_KEY_HERE"
+                if (self.summarize_cfg.get("enabled", True)
+                        and text_len >= self.summarize_cfg.get("threshold", 500)
+                        and api_configured):
+                    self.summarize_btn.config(state=tk.NORMAL)
+                    self.result_text.insert(tk.END, f"\n\n💡 识别到 {text_len} 字（≥{self.summarize_cfg['threshold']}），可点击「🤖 AI 总结」提炼要点")
+                elif self.summarize_cfg.get("enabled", True) and text_len >= self.summarize_cfg.get("threshold", 500):
+                    # 字数够但 API 未配置，显示提示
+                    _, status_text = get_api_key_status()
+                    self.result_text.insert(tk.END, f"\n\n⚠️ 识别到 {text_len} 字，但 {status_text}")
                 # 切换到「已识别」状态
                 self.set_window_state("recognized")
             else:
@@ -370,12 +433,14 @@ class OcrGuiApp:
                 self.result_text.insert(tk.END, "❌ 未识别到文字\n\n请确保图片清晰，包含可识别的文字内容。")
                 self.save_btn.config(state=tk.DISABLED)
                 self.discard_btn.config(state=tk.DISABLED)
+                self.summarize_btn.config(state=tk.DISABLED, text="🤖 AI 总结")
                 # 保持在 preview 状态
         except Exception as e:
             self.result_text.delete(1.0, tk.END)
             self.result_text.insert(tk.END, f"❌ OCR 识别失败:\n\n{str(e)}")
             self.save_btn.config(state=tk.DISABLED)
             self.discard_btn.config(state=tk.DISABLED)
+            self.summarize_btn.config(state=tk.DISABLED, text="🤖 AI 总结")
 
     def format_for_obsidian(self, text, source_file=None):
         filename = os.path.basename(source_file) if source_file else "截图"
@@ -383,7 +448,10 @@ class OcrGuiApp:
         lines = text.strip().split('\n')
         cleaned_lines = [line.strip() for line in lines if line.strip()]
         cleaned_text = '\n'.join(cleaned_lines)
-        formatted = f"\n---\n**📷 OCR 识别** ({timestamp})\n**来源**: `{filename}`\n\n{cleaned_text}\n"
+        formatted = f"\n---\n**📷 OCR 识别** ({timestamp})\n**来源**: `{filename}`\n\n{cleaned_text}"
+        if self.summary_text and not self.summary_text.startswith("❌"):
+            formatted += f"\n\n> **🤖 AI 总结**: {self.summary_text}"
+        formatted += "\n"
         return formatted.strip()
 
     def save_to_obsidian(self):
@@ -405,12 +473,54 @@ class OcrGuiApp:
         except Exception as e:
             messagebox.showerror("保存失败", str(e))
 
+    def do_summarize(self):
+        """调用 AI API 总结 OCR 文本"""
+        if not self.ocr_text:
+            messagebox.showwarning("提示", "没有可总结的内容")
+            return
+        self.summarize_btn.config(state=tk.DISABLED, text="⏳ 总结中...")
+        self.root.update()
+
+        def _call():
+            try:
+                import requests
+                cfg = self.summarize_cfg
+                prompt = cfg["prompt"].replace("{text}", self.ocr_text)
+                resp = requests.post(
+                    f"{cfg['api_base']}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {cfg['api_key']}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": cfg["model"],
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.3
+                    },
+                    timeout=60
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                self.summary_text = data["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                self.summary_text = f"❌ 总结失败: {str(e)}"
+
+            # 回到主线程更新 UI
+            def _update():
+                self.result_text.insert(tk.END, "\n\n" + "─" * 50)
+                self.result_text.insert(tk.END, f"\n🤖 AI 总结:\n\n{self.summary_text}\n")
+                self.summarize_btn.config(state=tk.NORMAL, text="🤖 AI 总结")
+            self.root.after(0, _update)
+
+        threading.Thread(target=_call, daemon=True).start()
+
     def discard_result(self):
         if messagebox.askyesno("确认", "确定丢弃当前识别结果吗？"):
             self.clear_all()
 
     def clear_all(self):
         self.ocr_text = ""
+        self.summary_text = ""
         self.current_image = None
         self.result_text.delete(1.0, tk.END)
         self.preview_canvas.delete("all")
@@ -421,6 +531,7 @@ class OcrGuiApp:
         )
         self.preview_canvas.config(scrollregion=(0, 0, 800, 300))
         self.ocr_btn.config(state=tk.DISABLED)
+        self.summarize_btn.config(state=tk.DISABLED, text="🤖 AI 总结")
         self.save_btn.config(state=tk.DISABLED)
         self.discard_btn.config(state=tk.DISABLED)
         # 回到初始紧凑状态
