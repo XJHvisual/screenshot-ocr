@@ -19,6 +19,14 @@ if sys.platform == 'win32':
 
 from rapidocr_onnxruntime import RapidOCR
 
+# Layout analyzer（图
+LAYOUT_AVAILABLE = False
+try:
+    from layout_analyzer import extract_image_regions
+    LAYOUT_AVAILABLE = True
+except ImportError:
+    pass
+
 
 class OCRToNote:
     def __init__(self, obsidian_vault: str):
@@ -36,6 +44,7 @@ class OCRToNote:
         print("正在加载 OCR 模型...")
         self.ocr = RapidOCR()
         print("OCR 模型加载完成")
+        self.image_regions = []  # 图文分离：提取的图片区域
 
     def list_notes(self, folder: str = None) -> list:
         """
@@ -74,6 +83,14 @@ class OCRToNote:
         # 执行 OCR
         result, elapse = self.ocr(str(img_path))
 
+        # 图文分离：提取非文字区域的图片
+        self.image_regions = []
+        if result and LAYOUT_AVAILABLE:
+            try:
+                self.image_regions = extract_image_regions(str(img_path), result)
+            except Exception as e:
+                print(f"[layout] image region extraction failed: {e}")
+
         if result is None or len(result) == 0:
             return ""
 
@@ -92,6 +109,22 @@ class OCRToNote:
 
         return header + text
 
+    def save_images_to_vault(self):
+        """Copy extracted image regions to the Obsidian vault's attachments directory."""
+        if not self.image_regions:
+            return ""
+        import shutil
+        attach_dir = self.vault_path / "attachments"
+        attach_dir.mkdir(parents=True, exist_ok=True)
+
+        lines = ["\n### 📸 图片区域\n"]
+        for i, region in enumerate(self.image_regions):
+            src = Path(region["path"])
+            dst = attach_dir / src.name
+            shutil.copy2(src, dst)
+            lines.append(f"![图片 {i + 1}](attachments/{src.name})")
+        return "\n".join(lines)
+
     def append_to_note(self, note_path: str, content: str) -> bool:
         """
         追加内容到笔记
@@ -109,10 +142,17 @@ class OCRToNote:
             return False
 
         try:
+            # 图文分离：复制图片到 Vault
+            if self.image_regions:
+                img_md = self.save_images_to_vault()
+                content += img_md
+
             # 追加写入
             with open(note, 'a', encoding='utf-8') as f:
                 f.write(content)
             print(f"✓ 已追加到: {note.name}")
+            if self.image_regions:
+                print(f"  已复制 {len(self.image_regions)} 个图片到 attachments/")
             return True
         except Exception as e:
             print(f"写入失败: {e}")
@@ -148,6 +188,8 @@ class OCRToNote:
         print("-"*40)
         preview = ocr_text[:500] + "..." if len(ocr_text) > 500 else ocr_text
         print(preview)
+        if self.image_regions:
+            print(f"\n📷 检测到 {len(self.image_regions)} 个图片区域（已提取）")
         print("-"*40)
 
         # 3. 列出笔记供选择

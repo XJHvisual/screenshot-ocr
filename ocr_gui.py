@@ -48,6 +48,14 @@ try:
 except ImportError:
     OCR_AVAILABLE = False
 
+# Layout analyzer
+LAYOUT_AVAILABLE = False
+try:
+    from layout_analyzer import extract_image_regions
+    LAYOUT_AVAILABLE = True
+except ImportError:
+    pass
+
 # 总结配置
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SUMMARIZE_CONFIG_PATH = os.path.join(SCRIPT_DIR, "summarize_config.json")
@@ -99,6 +107,8 @@ class OcrGuiApp:
         self.ocr_text = ""
         self.summary_text = ""
         self.current_image = None
+        self.image_regions = []  # 提取的图片区域
+        self.split_mode = tk.BooleanVar(value=True)  # 图文分离模式（默认开启）
         self.vault_path = VAULT_PATH
         self.summarize_cfg = load_summarize_config()
 
@@ -228,6 +238,17 @@ class OcrGuiApp:
                                         self.clear_all, color_key="muted",
                                         font_size=11)
         self.clear_btn.pack(side=tk.LEFT)
+
+        # 图文分离开关
+        self.split_check = tk.Checkbutton(
+            btn_bar, text="📷→📝 图文分离（图片保留，文字识别）",
+            variable=self.split_mode, font=(FONT_FAMILY, 10),
+            bg=COLORS["bg"], fg=COLORS["text_light"],
+            selectcolor=COLORS["card_bg"], activebackground=COLORS["bg"],
+        )
+        self.split_check.pack(side=tk.RIGHT, padx=(20, 0))
+        if not LAYOUT_AVAILABLE:
+            self.split_check.config(state=tk.DISABLED)
 
         # ===== OCR 结果卡片 =====
         result_card = self._make_card(self.root, "OCR 识别结果", "📝")
@@ -399,6 +420,16 @@ class OcrGuiApp:
             preprocessed_path = self.preprocess_image(self.current_image)
             result, elapse = OCR_ENGINE(preprocessed_path)
 
+            # 图文分离：提取非文字区域的图片
+            self.image_regions = []
+            if result and LAYOUT_AVAILABLE and self.split_mode.get():
+                try:
+                    self.image_regions = extract_image_regions(
+                        self.current_image, result
+                    )
+                except Exception as e:
+                    print(f"[layout] image region extraction failed: {e}")
+
             if result:
                 self.ocr_text = "\n".join([item[1] for item in result])
                 self.result_text.delete(1.0, tk.END)
@@ -411,6 +442,25 @@ class OcrGuiApp:
                 else:
                     elapse_str = f"{elapse:.2f}"
                 self.result_text.insert(tk.END, f"\n⏱️ 识别耗时: {elapse_str}秒")
+
+                # 显示提取的图片区域（图文分离模式）
+                if self.image_regions:
+                    from PIL import Image, ImageTk
+                    n = len(self.image_regions)
+                    self._photo_refs = []  # 防止 PhotoImage 被 GC
+                    self.result_text.insert(tk.END, f"\n\n📷 检测到 {n} 个图片区域（已保留）")
+                    for i, region in enumerate(self.image_regions):
+                        try:
+                            img = Image.open(region["path"])
+                            img.thumbnail((240, 180), Image.Resampling.LANCZOS)
+                            photo = ImageTk.PhotoImage(img)
+                            self._photo_refs.append(photo)  # 保持引用
+                            self.result_text.image_create(tk.END, image=photo)
+                            self.result_text.insert(tk.END, f"\n  [图片 {i + 1}]({region['w']}x{region['h']})")
+                        except Exception:
+                            self.result_text.insert(tk.END, f"\n  [图片 {i + 1}] {region['path']}")
+                    self.result_text.insert(tk.END, "\n\n💡 以上图片区域已保留原图，存入笔记时会以 Markdown 图片语法引用")
+
                 self.save_btn.config(state=tk.NORMAL)
                 self.discard_btn.config(state=tk.NORMAL)
                 # 字数超过阈值且API已配置 → 启用总结按钮
@@ -449,6 +499,14 @@ class OcrGuiApp:
         cleaned_lines = [line.strip() for line in lines if line.strip()]
         cleaned_text = '\n'.join(cleaned_lines)
         formatted = f"\n---\n**📷 OCR 识别** ({timestamp})\n**来源**: `{filename}`\n\n{cleaned_text}"
+
+        # 图文分离模式：嵌入提取的图片区域
+        if self.image_regions:
+            formatted += f"\n\n### 📸 图片区域 ({len(self.image_regions)} 个)\n"
+            for i, region in enumerate(self.image_regions):
+                path = region["path"].replace('\\', '/')
+                formatted += f"\n![图片 {i + 1}]({path})"
+
         if self.summary_text and not self.summary_text.startswith("❌"):
             formatted += f"\n\n> **🤖 AI 总结**: {self.summary_text}"
         formatted += "\n"
@@ -463,12 +521,28 @@ class OcrGuiApp:
             messagebox.showwarning("提示", "请选择目标笔记")
             return
         note_path = os.path.join(self.vault_path, target_note)
+
+        # 图文分离模式：把图片复制到 Vault 目录
+        if self.image_regions:
+            import shutil
+            attach_dir = os.path.join(self.vault_path, "attachments")
+            os.makedirs(attach_dir, exist_ok=True)
+            for i, region in enumerate(self.image_regions):
+                src = region["path"]
+                dst = os.path.join(attach_dir, os.path.basename(src))
+                shutil.copy2(src, dst)
+                # 更新为 vault 相对路径
+                self.image_regions[i]["path"] = f"attachments/{os.path.basename(src)}"
+
         content = self.format_for_obsidian(self.ocr_text, self.current_image)
         try:
             with open(note_path, 'a', encoding='utf-8') as f:
                 f.write("\n" + "-" * 60 + "\n")
                 f.write(content + "\n")
-            messagebox.showinfo("成功", f"✅ 已存入:\n{target_note}")
+            msg = f"✅ 已存入:\n{target_note}"
+            if self.image_regions:
+                msg += f"\n📸 {len(self.image_regions)} 个图片已复制到 attachments/ 目录"
+            messagebox.showinfo("成功", msg)
             self.clear_all()
         except Exception as e:
             messagebox.showerror("保存失败", str(e))
@@ -522,6 +596,7 @@ class OcrGuiApp:
         self.ocr_text = ""
         self.summary_text = ""
         self.current_image = None
+        self.image_regions = []  # 清空图片区域
         self.result_text.delete(1.0, tk.END)
         self.preview_canvas.delete("all")
         self.preview_canvas.create_text(
